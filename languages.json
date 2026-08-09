@@ -1,0 +1,11 @@
+[
+  {
+    "code": "run_Latn",
+    "label": "Kirundi",
+    "flag": "🇧🇮",
+    "modelCode": "kin_Latn"
+  },
+  { "code": "fra_Latn", "label": "Français", "flag": "🇫🇷", "ttsLocale": "fr-FR" },
+  { "code": "eng_Latn", "label": "English", "flag": "🇬🇧", "ttsLocale": "en-US" },
+  { "code": "swh_Latn", "label": "Kiswahili", "flag": "🇰🇪", "ttsLocale": "sw-KE" }
+]
