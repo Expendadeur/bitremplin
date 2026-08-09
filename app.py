@@ -26,7 +26,6 @@ from fastapi import FastAPI, HTTPException, Depends, Header
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from huggingface_hub import InferenceClient
-from huggingface_hub.errors import HfHubHTTPError
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -167,19 +166,22 @@ def translate(req: TranslateRequest):
             result = client.translation(req.text, src_lang=model_src, tgt_lang=model_tgt)
             translation = result if isinstance(result, str) else result.translation_text
             return TranslateResponse(translation=translation, source=req.source, target=req.target)
-        except HfHubHTTPError as e:
-            last_error = e
-            # 503 = modele en cours de "reveil" cote HF (cold start) -> on reessaie
+        except Exception as e:
+            # On capture TOUTE exception (pas seulement les erreurs HTTP HF) pour
+            # eviter un 500 muet et voir precisement ce qui echoue : mauvais
+            # parametre, modele non supporte par l'infrastructure serverless,
+            # timeout, etc. Le detail complet est renvoye dans la reponse pour
+            # diagnostiquer facilement pendant les tests.
+            last_error = f"{type(e).__name__}: {e}"
+            print(f"[BiTremplin] Erreur tentative {attempt}/{MAX_RETRIES} : {last_error}")
             if "503" in str(e) and attempt < MAX_RETRIES:
-                print(f"[BiTremplin] Modele en cours de chargement cote HF, tentative {attempt}/{MAX_RETRIES}...")
                 time.sleep(RETRY_DELAY_S)
                 continue
             break
 
     raise HTTPException(
         status_code=503,
-        detail=f"Le modele n'a pas repondu apres {MAX_RETRIES} tentatives "
-               f"(infrastructure partagee HF, reessaie dans une minute). Detail : {last_error}",
+        detail=f"Le modele n'a pas repondu apres {MAX_RETRIES} tentative(s). Detail : {last_error}",
     )
 
 
