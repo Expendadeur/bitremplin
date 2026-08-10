@@ -1,31 +1,27 @@
 """
-BiTremplin - API de traduction (version legere, via HF Inference API Serverless)
-=================================================================================
-Contrairement a la version precedente qui chargeait le modele en RAM locale
-(necessitant plusieurs Go), cette version appelle l'API Inference Serverless
-de Hugging Face : c'est HF qui fait tourner le modele sur SES machines, ce
-backend ne fait que relayer la requete. Resultat : aucune dependance torch/
-transformers lourde, RAM necessaire minime -> tient dans le tier gratuit
-Render (512 Mo).
+BiTremplin - API de traduction (version relais vers Kaggle+ngrok)
+====================================================================
+L'Inference API Serverless de Hugging Face ne supporte pas les modeles
+fine-tunes personnels non adoptes par un fournisseur (erreur StopIteration
+constatee en test). Cette version relaie donc les requetes de traduction
+vers une session Kaggle qui fait tourner le vrai modele (voir
+run_api_kaggle_ngrok.py), exposee via un tunnel ngrok.
 
-Limite honnete a connaitre : un modele fine-tune personnel, peu utilise,
-n'est pas toujours "chaud" sur l'infrastructure partagee de HF. Un premier
-appel peut recevoir une erreur 503 (modele en cours de chargement cote HF) -
-ce code reessaie automatiquement plusieurs fois avant d'abandonner. Si ca
-reste instable en pratique, la solution Kaggle+ngrok (voir nos echanges
-precedents) reste le filet de secours.
+Render reste le point d'entree stable pour le frontend (URL fixe), mais le
+calcul reel depend d'une session Kaggle active -> renseigne KAGGLE_API_URL
+(variable d'environnement sur Render) a chaque redemarrage de la session
+Kaggle, avec la nouvelle URL ngrok affichee par le script.
 """
 
 import os
 import json
-import time
 from pathlib import Path
 from typing import Optional, List
 
+import httpx
 from fastapi import FastAPI, HTTPException, Depends, Header
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from huggingface_hub import InferenceClient
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -33,10 +29,12 @@ from huggingface_hub import InferenceClient
 
 MODEL_NAME = os.environ.get("MODEL_NAME", "Expendadeur/nllb-kin-fr")
 
-# Necessaire meme pour un modele public : identifie le compte aupres de HF et
-# evite les limites de debit anonymes, plus severes. Cree un token (role
-# "read" suffit) sur https://huggingface.co/settings/tokens
-HF_TOKEN = os.environ.get("HF_TOKEN", "")
+# URL ngrok de la session Kaggle active (voir run_api_kaggle_ngrok.py).
+# A METTRE A JOUR sur Render (Settings > Environment) a chaque redemarrage
+# de la session Kaggle, car l'URL ngrok change a chaque fois (sauf domaine
+# fixe reserve). Sans ca, /translate repond une erreur claire plutot que de
+# planter silencieusement.
+KAGGLE_API_URL = os.environ.get("KAGGLE_API_URL", "")
 
 ADMIN_TOKEN = os.environ.get("ADMIN_TOKEN", "change-me")
 
@@ -44,14 +42,13 @@ BASE_DIR = Path(__file__).parent
 LANG_FILE = BASE_DIR / "languages.json"
 ADMIN_FILE = BASE_DIR / "admins.json"
 
-MAX_RETRIES = 4
-RETRY_DELAY_S = 5  # entre chaque tentative si le modele est "en train de charger" cote HF
+REQUEST_TIMEOUT_S = 60  # le modele + generation peut prendre du temps sur CPU Kaggle
 
 # ---------------------------------------------------------------------------
 # App
 # ---------------------------------------------------------------------------
 
-app = FastAPI(title="BiTremplin Translation API (Inference API)", version="1.0.0")
+app = FastAPI(title="BiTremplin Translation API (relais Kaggle)", version="1.0.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -61,11 +58,10 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-if not HF_TOKEN:
-    print("[BiTremplin] ATTENTION : HF_TOKEN non defini, risque de limites de debit basses.")
-
-client = InferenceClient(model=MODEL_NAME, token=HF_TOKEN or None)
-print(f"[BiTremplin] Client Inference API pret pour : {MODEL_NAME}")
+if not KAGGLE_API_URL:
+    print("[BiTremplin] ATTENTION : KAGGLE_API_URL non definie. /translate renverra une erreur claire tant qu'elle ne l'est pas.")
+else:
+    print(f"[BiTremplin] Relais configure vers : {KAGGLE_API_URL}")
 
 
 # ---------------------------------------------------------------------------
@@ -130,7 +126,12 @@ def check_admin(x_admin_token: str = Header(default="")):
 
 @app.get("/")
 def root():
-    return {"status": "ok", "model": MODEL_NAME, "mode": "hf-inference-api"}
+    return {
+        "status": "ok",
+        "model": MODEL_NAME,
+        "mode": "relais-kaggle",
+        "kaggle_configured": bool(KAGGLE_API_URL),
+    }
 
 
 @app.get("/languages", response_model=List[LanguageItem])
@@ -157,32 +158,42 @@ def translate(req: TranslateRequest):
     if req.target not in langs_by_code:
         raise HTTPException(status_code=403, detail=f"Langue cible non autorisee : {req.target}")
 
-    model_src = langs_by_code[req.source].get("modelCode") or req.source
-    model_tgt = langs_by_code[req.target].get("modelCode") or req.target
+    if not KAGGLE_API_URL:
+        raise HTTPException(
+            status_code=503,
+            detail="KAGGLE_API_URL non configuree sur Render. Lance run_api_kaggle_ngrok.py "
+                   "dans une session Kaggle, puis colle l'URL ngrok affichee dans les "
+                   "variables d'environnement Render (Settings > Environment).",
+        )
 
-    last_error = None
-    for attempt in range(1, MAX_RETRIES + 1):
-        try:
-            result = client.translation(req.text, src_lang=model_src, tgt_lang=model_tgt)
-            translation = result if isinstance(result, str) else result.translation_text
-            return TranslateResponse(translation=translation, source=req.source, target=req.target)
-        except Exception as e:
-            # On capture TOUTE exception (pas seulement les erreurs HTTP HF) pour
-            # eviter un 500 muet et voir precisement ce qui echoue : mauvais
-            # parametre, modele non supporte par l'infrastructure serverless,
-            # timeout, etc. Le detail complet est renvoye dans la reponse pour
-            # diagnostiquer facilement pendant les tests.
-            last_error = f"{type(e).__name__}: {e}"
-            print(f"[BiTremplin] Erreur tentative {attempt}/{MAX_RETRIES} : {last_error}")
-            if "503" in str(e) and attempt < MAX_RETRIES:
-                time.sleep(RETRY_DELAY_S)
-                continue
-            break
-
-    raise HTTPException(
-        status_code=503,
-        detail=f"Le modele n'a pas repondu apres {MAX_RETRIES} tentative(s). Detail : {last_error}",
-    )
+    # Relais simple : le script Kaggle fait deja tout le travail (verification
+    # des langues autorisees, conversion code public -> modelCode, appel au
+    # modele reel). Render se contente de transmettre et de renvoyer la reponse.
+    try:
+        resp = httpx.post(
+            f"{KAGGLE_API_URL.rstrip('/')}/translate",
+            json={"text": req.text, "source": req.source, "target": req.target},
+            timeout=REQUEST_TIMEOUT_S,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        return TranslateResponse(
+            translation=data["translation"], source=req.source, target=req.target
+        )
+    except httpx.ConnectError:
+        raise HTTPException(
+            status_code=503,
+            detail="Impossible de joindre la session Kaggle. Verifie qu'elle est bien "
+                   "active et que KAGGLE_API_URL est a jour (l'URL ngrok change a "
+                   "chaque redemarrage de la session).",
+        )
+    except httpx.TimeoutException:
+        raise HTTPException(status_code=504, detail="La session Kaggle n'a pas repondu a temps.")
+    except httpx.HTTPStatusError as e:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Erreur renvoyee par la session Kaggle ({e.response.status_code}) : {e.response.text}",
+        )
 
 
 # ---------------------------------------------------------------------------
