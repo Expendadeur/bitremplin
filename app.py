@@ -1,5 +1,6 @@
 """
-BiTremplin - API de traduction (version relais vers Kaggle+ngrok)
+BiTremplin - API de traduction (version relais vers Kaggle+ngrok, + traduction
+de documents Word/PDF/txt)
 ====================================================================
 L'Inference API Serverless de Hugging Face ne supporte pas les modeles
 fine-tunes personnels non adoptes par un fournisseur (erreur StopIteration
@@ -13,14 +14,17 @@ calcul reel depend d'une session Kaggle active -> renseigne KAGGLE_API_URL
 Kaggle, avec la nouvelle URL ngrok affichee par le script.
 """
 
+import io
 import os
 import json
+import re
 from pathlib import Path
 from typing import Optional, List
 
 import httpx
-from fastapi import FastAPI, HTTPException, Depends, Header
+from fastapi import FastAPI, HTTPException, Depends, Header, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 # ---------------------------------------------------------------------------
@@ -44,11 +48,17 @@ ADMIN_FILE = BASE_DIR / "admins.json"
 
 REQUEST_TIMEOUT_S = 60  # le modele + generation peut prendre du temps sur CPU Kaggle
 
+# Taille max d'un morceau de texte envoye en une seule traduction. Le modele a
+# ete entraine avec max_length=128 tokens ; on reste prudent en caracteres
+# pour eviter les troncatures silencieuses qui degraderaient la qualite.
+CHUNK_MAX_CHARS = 400
+MAX_DOCUMENT_CHARS = 200_000  # garde-fou anti-abus (~40-60 pages) sur un service gratuit
+
 # ---------------------------------------------------------------------------
 # App
 # ---------------------------------------------------------------------------
 
-app = FastAPI(title="BiTremplin Translation API (relais Kaggle)", version="1.0.0")
+app = FastAPI(title="BiTremplin Translation API (relais Kaggle)", version="1.1.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -120,6 +130,156 @@ def check_admin(x_admin_token: str = Header(default="")):
     return True
 
 
+def check_languages_allowed(source: str, target: str) -> dict:
+    """Verifie que les deux langues sont autorisees et renvoie le mapping
+    complet code -> config (reutilise par /translate et /translate-document)."""
+    langs_by_code = {lang["code"]: lang for lang in load_languages()}
+    if source not in langs_by_code:
+        raise HTTPException(status_code=403, detail=f"Langue source non autorisee : {source}")
+    if target not in langs_by_code:
+        raise HTTPException(status_code=403, detail=f"Langue cible non autorisee : {target}")
+    return langs_by_code
+
+
+def translate_text(text: str, source: str, target: str) -> str:
+    """Traduction d'un morceau de texte unique via le relais Kaggle. Utilisee
+    a la fois par /translate et par /translate-document (chunk par chunk)."""
+    if not KAGGLE_API_URL:
+        raise HTTPException(
+            status_code=503,
+            detail="KAGGLE_API_URL non configuree sur Render. Lance run_api_kaggle_ngrok.py "
+                   "dans une session Kaggle, puis colle l'URL ngrok affichee dans les "
+                   "variables d'environnement Render (Settings > Environment).",
+        )
+    try:
+        resp = httpx.post(
+            f"{KAGGLE_API_URL.rstrip('/')}/translate",
+            json={"text": text, "source": source, "target": target},
+            timeout=REQUEST_TIMEOUT_S,
+        )
+        resp.raise_for_status()
+        return resp.json()["translation"]
+    except httpx.ConnectError:
+        raise HTTPException(
+            status_code=503,
+            detail="Impossible de joindre la session Kaggle. Verifie qu'elle est bien "
+                   "active et que KAGGLE_API_URL est a jour (l'URL ngrok change a "
+                   "chaque redemarrage de la session).",
+        )
+    except httpx.TimeoutException:
+        raise HTTPException(status_code=504, detail="La session Kaggle n'a pas repondu a temps.")
+    except httpx.HTTPStatusError as e:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Erreur renvoyee par la session Kaggle ({e.response.status_code}) : {e.response.text}",
+        )
+
+
+# ---------------------------------------------------------------------------
+# Extraction de texte depuis un document (txt / docx / pdf)
+# ---------------------------------------------------------------------------
+
+def extract_paragraphs(filename: str, raw_bytes: bytes) -> List[str]:
+    """Renvoie une liste de paragraphes (texte brut) extraits du document,
+    quel que soit son format. Chaque entree devient un paragraphe distinct
+    dans le document traduit en sortie."""
+    ext = filename.lower().rsplit(".", 1)[-1] if "." in filename else ""
+
+    if ext == "txt":
+        text = raw_bytes.decode("utf-8", errors="replace")
+        paragraphs = [p.strip() for p in text.split("\n") if p.strip()]
+
+    elif ext == "docx":
+        try:
+            import docx
+        except ImportError:
+            raise HTTPException(status_code=500, detail="python-docx non installe cote serveur.")
+        document = docx.Document(io.BytesIO(raw_bytes))
+        paragraphs = [p.text.strip() for p in document.paragraphs if p.text.strip()]
+
+    elif ext == "pdf":
+        try:
+            from pypdf import PdfReader
+        except ImportError:
+            raise HTTPException(status_code=500, detail="pypdf non installe cote serveur.")
+        reader = PdfReader(io.BytesIO(raw_bytes))
+        paragraphs = []
+        for page in reader.pages:
+            page_text = page.extract_text() or ""
+            paragraphs.extend(p.strip() for p in page_text.split("\n") if p.strip())
+
+    else:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Format non supporte : .{ext}. Formats acceptes : .txt, .docx, .pdf",
+        )
+
+    if not paragraphs:
+        raise HTTPException(status_code=400, detail="Aucun texte extrait du document (fichier vide ou illisible).")
+
+    total_chars = sum(len(p) for p in paragraphs)
+    if total_chars > MAX_DOCUMENT_CHARS:
+        raise HTTPException(
+            status_code=413,
+            detail=f"Document trop volumineux ({total_chars} caracteres, max {MAX_DOCUMENT_CHARS}).",
+        )
+
+    return paragraphs
+
+
+def split_into_chunks(paragraph: str, max_chars: int = CHUNK_MAX_CHARS) -> List[str]:
+    """Decoupe un paragraphe en morceaux traduisibles individuellement, en
+    coupant sur les frontieres de phrases plutot qu'au milieu d'un mot."""
+    if len(paragraph) <= max_chars:
+        return [paragraph]
+
+    sentences = re.split(r"(?<=[.!?])\s+", paragraph)
+    chunks, current = [], ""
+    for sentence in sentences:
+        if len(current) + len(sentence) + 1 <= max_chars:
+            current = f"{current} {sentence}".strip()
+        else:
+            if current:
+                chunks.append(current)
+            # Phrase elle-meme trop longue -> coupe brutalement en dernier recours
+            current = sentence if len(sentence) <= max_chars else sentence[:max_chars]
+    if current:
+        chunks.append(current)
+    return chunks
+
+
+def translate_paragraphs(paragraphs: List[str], source: str, target: str) -> List[str]:
+    translated = []
+    for paragraph in paragraphs:
+        chunks = split_into_chunks(paragraph)
+        translated_chunks = [translate_text(chunk, source, target) for chunk in chunks]
+        translated.append(" ".join(translated_chunks))
+    return translated
+
+
+def build_output_file(paragraphs: List[str], output_format: str):
+    """Construit le fichier de sortie a partir des paragraphes traduits.
+    Renvoie (contenu binaire, nom de fichier, media type)."""
+    if output_format == "docx":
+        try:
+            import docx
+        except ImportError:
+            raise HTTPException(status_code=500, detail="python-docx non installe cote serveur.")
+        document = docx.Document()
+        for paragraph in paragraphs:
+            document.add_paragraph(paragraph)
+        buffer = io.BytesIO()
+        document.save(buffer)
+        return (
+            buffer.getvalue(),
+            "traduction.docx",
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        )
+    else:  # txt par defaut - le plus simple et le plus fiable dans tous les cas
+        content = "\n\n".join(paragraphs).encode("utf-8")
+        return content, "traduction.txt", "text/plain; charset=utf-8"
+
+
 # ---------------------------------------------------------------------------
 # Routes publiques
 # ---------------------------------------------------------------------------
@@ -152,48 +312,43 @@ def translate(req: TranslateRequest):
     if len(req.text) > 5000:
         raise HTTPException(status_code=400, detail="Texte trop long (max 5000 caracteres)")
 
-    langs_by_code = {lang["code"]: lang for lang in load_languages()}
-    if req.source not in langs_by_code:
-        raise HTTPException(status_code=403, detail=f"Langue source non autorisee : {req.source}")
-    if req.target not in langs_by_code:
-        raise HTTPException(status_code=403, detail=f"Langue cible non autorisee : {req.target}")
+    check_languages_allowed(req.source, req.target)
+    translation = translate_text(req.text, req.source, req.target)
+    return TranslateResponse(translation=translation, source=req.source, target=req.target)
 
-    if not KAGGLE_API_URL:
-        raise HTTPException(
-            status_code=503,
-            detail="KAGGLE_API_URL non configuree sur Render. Lance run_api_kaggle_ngrok.py "
-                   "dans une session Kaggle, puis colle l'URL ngrok affichee dans les "
-                   "variables d'environnement Render (Settings > Environment).",
-        )
 
-    # Relais simple : le script Kaggle fait deja tout le travail (verification
-    # des langues autorisees, conversion code public -> modelCode, appel au
-    # modele reel). Render se contente de transmettre et de renvoyer la reponse.
-    try:
-        resp = httpx.post(
-            f"{KAGGLE_API_URL.rstrip('/')}/translate",
-            json={"text": req.text, "source": req.source, "target": req.target},
-            timeout=REQUEST_TIMEOUT_S,
-        )
-        resp.raise_for_status()
-        data = resp.json()
-        return TranslateResponse(
-            translation=data["translation"], source=req.source, target=req.target
-        )
-    except httpx.ConnectError:
-        raise HTTPException(
-            status_code=503,
-            detail="Impossible de joindre la session Kaggle. Verifie qu'elle est bien "
-                   "active et que KAGGLE_API_URL est a jour (l'URL ngrok change a "
-                   "chaque redemarrage de la session).",
-        )
-    except httpx.TimeoutException:
-        raise HTTPException(status_code=504, detail="La session Kaggle n'a pas repondu a temps.")
-    except httpx.HTTPStatusError as e:
-        raise HTTPException(
-            status_code=502,
-            detail=f"Erreur renvoyee par la session Kaggle ({e.response.status_code}) : {e.response.text}",
-        )
+@app.post("/translate-document")
+async def translate_document(
+    file: UploadFile = File(...),
+    source: str = Form(...),
+    target: str = Form(...),
+    output_format: str = Form("docx"),  # "docx" ou "txt"
+):
+    """Traduit un document entier (.txt, .docx, .pdf). Extrait le texte,
+    le decoupe en morceaux, traduit chaque morceau via la session Kaggle
+    (meme logique que /translate), puis renvoie un nouveau fichier a
+    telecharger avec le texte traduit.
+
+    NOTE : le PDF ne conserve pas sa mise en page d'origine (tableaux,
+    images, colonnes) - seul le texte est extrait et retraduit dans un
+    document simple. Pour un .docx en entree, la structure en paragraphes
+    est preservee ; polices, styles et images ne le sont pas.
+    """
+    if output_format not in ("docx", "txt"):
+        raise HTTPException(status_code=400, detail="output_format doit etre 'docx' ou 'txt'")
+
+    check_languages_allowed(source, target)
+
+    raw_bytes = await file.read()
+    paragraphs = extract_paragraphs(file.filename or "document.txt", raw_bytes)
+    translated_paragraphs = translate_paragraphs(paragraphs, source, target)
+    content, out_filename, media_type = build_output_file(translated_paragraphs, output_format)
+
+    return StreamingResponse(
+        io.BytesIO(content),
+        media_type=media_type,
+        headers={"Content-Disposition": f'attachment; filename="{out_filename}"'},
+    )
 
 
 # ---------------------------------------------------------------------------
