@@ -1,6 +1,6 @@
 """
 BiTremplin - API de traduction (version relais vers Kaggle+ngrok, + traduction
-de documents Word/PDF/txt)
+de documents Word/PDF/txt, avec streaming SSE)
 ====================================================================
 L'Inference API Serverless de Hugging Face ne supporte pas les modeles
 fine-tunes personnels non adoptes par un fournisseur (erreur StopIteration
@@ -14,9 +14,10 @@ calcul reel depend d'une session Kaggle active -> renseigne KAGGLE_API_URL
 Kaggle, avec la nouvelle URL ngrok affichee par le script.
 """
 
+import asyncio
 import io
-import os
 import json
+import os
 import re
 from pathlib import Path
 from typing import Optional, List
@@ -58,7 +59,7 @@ MAX_DOCUMENT_CHARS = 200_000  # garde-fou anti-abus (~40-60 pages) sur un servic
 # App
 # ---------------------------------------------------------------------------
 
-app = FastAPI(title="BiTremplin Translation API (relais Kaggle)", version="1.1.0")
+app = FastAPI(title="BiTremplin Translation API (relais Kaggle)", version="1.2.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -123,6 +124,10 @@ class LanguageItem(BaseModel):
 class AdminEmailItem(BaseModel):
     email: str
 
+class BuildDocumentRequest(BaseModel):
+    paragraphs: List[str]
+    output_format: str = "docx"  # "docx" ou "txt"
+
 
 def check_admin(x_admin_token: str = Header(default="")):
     if not ADMIN_TOKEN or x_admin_token != ADMIN_TOKEN:
@@ -143,7 +148,8 @@ def check_languages_allowed(source: str, target: str) -> dict:
 
 def translate_text(text: str, source: str, target: str) -> str:
     """Traduction d'un morceau de texte unique via le relais Kaggle. Utilisee
-    a la fois par /translate et par /translate-document (chunk par chunk)."""
+    a la fois par /translate et par /translate-document-stream (chunk par
+    chunk)."""
     if not KAGGLE_API_URL:
         raise HTTPException(
             status_code=503,
@@ -280,6 +286,11 @@ def build_output_file(paragraphs: List[str], output_format: str):
         return content, "traduction.txt", "text/plain; charset=utf-8"
 
 
+def sse_event(event: str, data: dict) -> str:
+    """Formatte une ligne au format SSE (text/event-stream)."""
+    return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
+
+
 # ---------------------------------------------------------------------------
 # Routes publiques
 # ---------------------------------------------------------------------------
@@ -324,10 +335,10 @@ async def translate_document(
     target: str = Form(...),
     output_format: str = Form("docx"),  # "docx" ou "txt"
 ):
-    """Traduit un document entier (.txt, .docx, .pdf). Extrait le texte,
-    le decoupe en morceaux, traduit chaque morceau via la session Kaggle
-    (meme logique que /translate), puis renvoie un nouveau fichier a
-    telecharger avec le texte traduit.
+    """Version NON streamee (conservee pour compatibilite / usage simple sans
+    affichage progressif) : traduit le document entier et renvoie directement
+    le fichier final. Pour l'affichage streaming cote frontend, preferer
+    /translate-document-stream + /build-document (voir plus bas).
 
     NOTE : le PDF ne conserve pas sa mise en page d'origine (tableaux,
     images, colonnes) - seul le texte est extrait et retraduit dans un
@@ -344,6 +355,82 @@ async def translate_document(
     translated_paragraphs = translate_paragraphs(paragraphs, source, target)
     content, out_filename, media_type = build_output_file(translated_paragraphs, output_format)
 
+    return StreamingResponse(
+        io.BytesIO(content),
+        media_type=media_type,
+        headers={"Content-Disposition": f'attachment; filename="{out_filename}"'},
+    )
+
+
+@app.post("/translate-document-stream")
+async def translate_document_stream(
+    file: UploadFile = File(...),
+    source: str = Form(...),
+    target: str = Form(...),
+):
+    """
+    Traduction de document en streaming SSE (text/event-stream) :
+
+      event: source     -> {"paragraphs": [...]}               (texte original, tout de suite)
+      event: paragraph  -> {"index": i, "translation": "..."}  (un par paragraphe traduit)
+      event: error      -> {"index": i, "detail": "..."}       (si un paragraphe echoue)
+      event: done        -> {"count": n}                        (fin du flux)
+
+    Le frontend affiche `source` immediatement a gauche, puis ajoute chaque
+    `paragraph` a droite au fur et a mesure (effet machine a ecrire). Une
+    fois le flux termine, il dispose de tous les paragraphes traduits et
+    peut appeler /build-document pour generer le fichier telechargeable,
+    sans re-traduire.
+    """
+    check_languages_allowed(source, target)
+
+    raw_bytes = await file.read()
+    paragraphs = extract_paragraphs(file.filename or "document.txt", raw_bytes)
+
+    async def event_generator():
+        # 1) Texte source complet, envoye immediatement
+        yield sse_event("source", {"paragraphs": paragraphs})
+
+        # 2) Traduction paragraphe par paragraphe, streamee au fur et a mesure
+        for i, paragraph in enumerate(paragraphs):
+            try:
+                chunks = split_into_chunks(paragraph)
+                # translate_text() est bloquant (httpx sync) -> on le passe
+                # dans un thread pour ne pas geler l'event loop et laisser
+                # les octets deja generes partir vers le client.
+                translated_chunks = [
+                    await asyncio.to_thread(translate_text, chunk, source, target)
+                    for chunk in chunks
+                ]
+                translation = " ".join(translated_chunks)
+                yield sse_event("paragraph", {"index": i, "translation": translation})
+            except HTTPException as e:
+                yield sse_event("error", {"index": i, "detail": e.detail})
+                # On continue avec les paragraphes suivants plutot que de
+                # couper tout le flux pour un seul paragraphe en echec.
+
+        yield sse_event("done", {"count": len(paragraphs)})
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",  # evite le buffering cote proxy (Render)
+        },
+    )
+
+
+@app.post("/build-document")
+def build_document(req: BuildDocumentRequest):
+    """
+    Construit le fichier final a partir de paragraphes DEJA traduits (recus
+    du flux /translate-document-stream cote client). Ne retraduit rien.
+    """
+    if req.output_format not in ("docx", "txt"):
+        raise HTTPException(status_code=400, detail="output_format doit etre 'docx' ou 'txt'")
+
+    content, out_filename, media_type = build_output_file(req.paragraphs, req.output_format)
     return StreamingResponse(
         io.BytesIO(content),
         media_type=media_type,
